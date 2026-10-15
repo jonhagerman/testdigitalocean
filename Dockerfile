@@ -20,6 +20,8 @@ RUN dotnet publish src/TestDigitalOcean/TestDigitalOcean.csproj \
     -o /app
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
+ARG APP_COMMIT=unknown
+ENV APP_COMMIT=$APP_COMMIT
 WORKDIR /app
 COPY --from=build /app .
 # aspnet images default to port 8080 and the non-root "app" user
