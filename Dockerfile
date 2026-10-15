@@ -1,16 +1,15 @@
 # syntax=docker/dockerfile:1
 
-FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0 AS build
-ARG TARGETARCH
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ARG VERSION=1.0.0
 WORKDIR /source
 
 COPY src/TestDigitalOcean/TestDigitalOcean.csproj src/TestDigitalOcean/
-RUN dotnet restore src/TestDigitalOcean/TestDigitalOcean.csproj -a $TARGETARCH
+RUN dotnet restore src/TestDigitalOcean/TestDigitalOcean.csproj
 
 COPY src/ src/
 RUN dotnet publish src/TestDigitalOcean/TestDigitalOcean.csproj \
-    -c Release -a $TARGETARCH --no-restore \
+    -c Release --no-restore \
     -p:InformationalVersion=$VERSION \
     -o /app
 
