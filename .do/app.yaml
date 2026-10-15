@@ -1,0 +1,33 @@
+# DigitalOcean App Platform spec.
+# Deployed by .github/workflows/docker-publish.yml with:
+#   doctl apps create --spec .do/app.yaml --upsert
+# ${IMAGE_TAG} is substituted by the workflow (envsubst) with the exact image tag just pushed.
+name: testdigitalocean
+region: nyc
+
+services:
+  - name: web
+    image:
+      registry_type: GHCR
+      registry: jonhagerman
+      repository: testdigitalocean
+      tag: ${IMAGE_TAG}
+      # Only needed if the GHCR package is private. Format "username:token" (PAT with read:packages).
+      # App Platform encrypts it after the first deploy.
+      # registry_credentials: ${GHCR_CREDENTIALS}
+    http_port: 8080
+    instance_count: 1
+    instance_size_slug: apps-s-1vcpu-0.5gb
+    routes:
+      - path: /
+    health_check:
+      http_path: /healthz
+      initial_delay_seconds: 10
+      period_seconds: 10
+    envs:
+      - key: ASPNETCORE_ENVIRONMENT
+        value: Production
+        scope: RUN_TIME
+
+alerts:
+  - rule: DEPLOYMENT_FAILED
