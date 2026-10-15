@@ -1,7 +1,7 @@
 # DigitalOcean App Platform spec.
-# Deployed by .github/workflows/docker-publish.yml with:
+# Deployed manually by .github/workflows/deploy.yml (Actions -> Deploy to App Platform -> Run workflow) with:
 #   doctl apps create --spec .do/app.yaml --upsert
-# ${IMAGE_TAG} is substituted by the workflow (envsubst) with the exact image tag just pushed.
+# ${IMAGE_TAG} is substituted by the workflow (envsubst) with the image tag chosen at deploy time.
 name: testdigitalocean
 region: nyc
 

@@ -67,30 +67,3 @@ jobs:
             VERSION=${{ steps.meta.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  deploy:
-    needs: build
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install doctl
-        uses: digitalocean/action-doctl@v2
-        with:
-          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-
-      - name: Render app spec
-        env:
-          GHCR_CREDENTIALS: ${{ secrets.GHCR_CREDENTIALS }}
-        run: |
-          IMAGE_TAG="sha-${GITHUB_SHA::7}" envsubst '${IMAGE_TAG} ${GHCR_CREDENTIALS}' < .do/app.yaml > app.rendered.yaml
-          cat app.rendered.yaml | grep -v registry_credentials
-
-      - name: Deploy to App Platform
-        run: doctl apps create --spec app.rendered.yaml --upsert --wait
