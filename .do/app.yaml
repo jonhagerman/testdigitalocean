@@ -1,7 +1,9 @@
 # DigitalOcean App Platform spec.
-# Deployed manually by .github/workflows/deploy.yml (Actions -> Deploy to App Platform -> Run workflow) with:
-#   doctl apps create --spec .do/app.yaml --upsert
-# ${IMAGE_TAG} is substituted by the workflow (envsubst) with the image tag chosen at deploy time.
+# This file is a template. Every build copies it into its release bundle alongside
+# manifest.json (.github/workflows/docker-publish.yml), and .github/workflows/deploy.yml
+# deploys the copy from the chosen bundle, so a rollback restores the spec as well as the image.
+# ${IMAGE_DIGEST} is substituted at deploy time with the digest recorded in the manifest,
+# pinning the exact image that was built rather than a mutable tag.
 name: testdigitalocean
 region: nyc
 
@@ -11,7 +13,7 @@ services:
       registry_type: GHCR
       registry: jonhagerman
       repository: testdigitalocean
-      tag: ${IMAGE_TAG}
+      digest: ${IMAGE_DIGEST}
       # GHCR package is private. Format "username:token" (PAT with read:packages).
       # App Platform encrypts it after the first deploy.
       registry_credentials: ${GHCR_CREDENTIALS}

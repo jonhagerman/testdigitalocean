@@ -1,12 +1,20 @@
 name: Deploy to App Platform
 
+# Deploys a release bundle (manifest.json + app.yaml) produced by docker-publish.yml.
+# - Deploy a build:        set build_run_id (blank = latest successful build of the selected branch/tag)
+# - Roll back one step:    tick rollback (redeploys what was live before the last successful deploy)
+# - Roll back further:     set build_run_id to any earlier build run
 on:
   workflow_dispatch:
     inputs:
-      image_tag:
-        description: "Image tag to deploy (e.g. sha-abc1234, 1.2.3, latest). Blank = sha tag of the selected branch/tag's commit."
+      build_run_id:
+        description: "Run ID of the 'Build and publish container' run to deploy. Blank = latest successful build of the selected branch/tag."
         required: false
         default: ""
+      rollback:
+        description: "Roll back: ignore build_run_id and redeploy the release that was live before the last successful deploy."
+        type: boolean
+        default: false
 
 concurrency:
   group: deploy-production
@@ -14,28 +22,51 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: production
     permissions:
-      contents: read
+      actions: read
       packages: read
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Resolve image tag
-        id: tag
+      - name: Fetch release manifest
         env:
-          INPUT_TAG: ${{ inputs.image_tag }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          ROLLBACK: ${{ inputs.rollback }}
         run: |
-          TAG="${INPUT_TAG:-sha-${GITHUB_SHA::7}}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Deploying ${REGISTRY}/${IMAGE_NAME}:${TAG}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ROLLBACK" = "true" ]; then
+            # Newest successful deploy is what's live now; the one before it is the rollback target.
+            target=$(gh run list --workflow deploy.yml --status success --limit 2 \
+              --json databaseId --jq '.[1].databaseId // empty')
+            [ -n "$target" ] || { echo "::error::No earlier successful deploy to roll back to"; exit 1; }
+            echo "Rolling back to the release deployed by run $target"
+            gh run download "$target" --name deployed-release --dir release
+          else
+            if [ -z "$BUILD_RUN_ID" ]; then
+              BUILD_RUN_ID=$(gh run list --workflow docker-publish.yml --branch "$GITHUB_REF_NAME" \
+                --event push --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+              [ -n "$BUILD_RUN_ID" ] || { echo "::error::No successful build found for $GITHUB_REF_NAME"; exit 1; }
+            fi
+            echo "Deploying the release built by run $BUILD_RUN_ID"
+            gh run download "$BUILD_RUN_ID" --name release-manifest --dir release
+          fi
+          cat release/manifest.json
+
+      - name: Validate release manifest
+        id: manifest
+        run: |
+          m=release/manifest.json
+          [ "$(jq -r .schemaVersion $m)" = "1" ] || { echo "::error::Unsupported manifest schemaVersion"; exit 1; }
+          spec="release/$(jq -r .spec.file $m)"
+          echo "$(jq -r .spec.sha256 $m)  $spec" | sha256sum -c -
+          echo "image=$(jq -r '"\(.image.registry)/\(.image.name)@\(.image.digest)"' $m)" >> "$GITHUB_OUTPUT"
+          echo "digest=$(jq -r .image.digest $m)" >> "$GITHUB_OUTPUT"
+          echo "spec=$spec" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -45,7 +76,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify image exists
-        run: docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:${{ steps.tag.outputs.tag }}"
+        run: docker buildx imagetools inspect "${{ steps.manifest.outputs.image }}"
 
       - name: Install doctl
         uses: digitalocean/action-doctl@v2
@@ -54,11 +85,47 @@ jobs:
 
       - name: Render app spec
         env:
-          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+          IMAGE_DIGEST: ${{ steps.manifest.outputs.digest }}
           GHCR_CREDENTIALS: ${{ secrets.GHCR_CREDENTIALS }}
         run: |
-          envsubst '${IMAGE_TAG} ${GHCR_CREDENTIALS}' < .do/app.yaml > app.rendered.yaml
+          envsubst '${IMAGE_DIGEST} ${GHCR_CREDENTIALS}' < "${{ steps.manifest.outputs.spec }}" > app.rendered.yaml
           grep -v registry_credentials app.rendered.yaml
 
       - name: Deploy to App Platform
-        run: doctl apps create --spec app.rendered.yaml --upsert --wait
+        run: |
+          doctl apps create --spec app.rendered.yaml --upsert --wait --output json > app.json
+          jq 'if type == "array" then .[0] else . end' app.json > app.single.json
+          jq '{id, live_url, active_deployment: .active_deployment.id}' app.single.json
+
+      # The deployed bundle is what a later rollback restores.
+      - name: Record deployment
+        env:
+          ROLLBACK: ${{ inputs.rollback }}
+        run: |
+          jq -n \
+            --arg deployedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg runId "$GITHUB_RUN_ID" \
+            --arg actor "$GITHUB_ACTOR" \
+            --argjson rollback "$ROLLBACK" \
+            --slurpfile app app.single.json \
+            '{
+              deployedAt: $deployedAt,
+              deployRunId: ($runId | tonumber),
+              actor: $actor,
+              rollback: $rollback,
+              appId: $app[0].id,
+              deploymentId: $app[0].active_deployment.id
+            }' > release/deployment.json
+          {
+            echo "### Deployed"
+            echo '```json'
+            jq -s '.[0] + {deployment: .[1]}' release/manifest.json release/deployment.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload deployed release
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployed-release
+          path: release/
+          retention-days: 90

@@ -56,6 +56,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push (linux/amd64)
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -68,3 +69,59 @@ jobs:
             APP_COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # The release bundle (manifest.json + the app spec template) is what deploy.yml
+      # deploys. It pins the image by digest, so deploying or rolling back to a build
+      # always gets exactly the image and spec that build produced.
+      - name: Create release manifest
+        if: github.event_name != 'pull_request'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p release
+          cp .do/app.yaml release/app.yaml
+          jq -n \
+            --arg version "$VERSION" \
+            --arg commit "$GITHUB_SHA" \
+            --arg ref "$GITHUB_REF" \
+            --arg runId "$GITHUB_RUN_ID" \
+            --arg runUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg builtAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg registry "$REGISTRY" \
+            --arg name "${IMAGE_NAME,,}" \
+            --arg digest "$DIGEST" \
+            --arg tags "$TAGS" \
+            --arg specSha256 "$(sha256sum release/app.yaml | cut -d' ' -f1)" \
+            '{
+              schemaVersion: 1,
+              app: "testdigitalocean",
+              version: $version,
+              commit: $commit,
+              ref: $ref,
+              build: { runId: ($runId | tonumber), runUrl: $runUrl, builtAt: $builtAt },
+              image: {
+                registry: $registry,
+                name: $name,
+                digest: $digest,
+                tags: ($tags | split("\n") | map(select(length > 0) | split(":") | last))
+              },
+              spec: { file: "app.yaml", sha256: $specSha256 }
+            }' > release/manifest.json
+          cat release/manifest.json
+          {
+            echo "### Release manifest"
+            echo "Deploy with **Actions -> Deploy to App Platform**, build run ID \`$GITHUB_RUN_ID\`."
+            echo '```json'
+            cat release/manifest.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release manifest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: release/
+          retention-days: 90
