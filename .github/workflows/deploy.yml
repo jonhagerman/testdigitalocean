@@ -2,7 +2,8 @@ name: Deploy to App Platform
 run-name: >-
   Deploy ${{ inputs.environment }}${{ inputs.rollback && ' - rollback' || '' }}${{ !inputs.rollback && inputs.build_run_id && format(' - build {0}', inputs.build_run_id) || '' }}${{ inputs.environment == 'production' && !inputs.rollback && inputs.skip_qa_check && ' - hotfix' || '' }}
 
-# Deploys a release bundle (manifest.json + per-environment app specs) produced by docker-publish.yml.
+# Deploys a release bundle (manifest.json + per-environment app specs + environments.yaml) produced
+# by docker-publish.yml, to the datacenter and VPC environments.yaml sets for the environment.
 # See docs/deployment.md. In short:
 # - Deploy a build:        pick the environment, set build_run_id (blank = latest successful build of the selected branch/tag)
 # - Promote to production: deploy the same build_run_id to production; it must have been deployed to QA first
@@ -59,16 +60,13 @@ jobs:
         run: |
           if [ "$ROLLBACK" = "true" ]; then
             # Newest successful deploy to this environment is what's live now; the one before it is
-            # the rollback target. Runs from before per-environment deploys were titled
-            # "Deploy to App Platform", uploaded "deployed-release", and all went to production.
+            # the rollback target.
             target=$(gh run list --workflow deploy.yml --status success --limit 100 --json databaseId,displayTitle |
               jq -r --arg env "$DEPLOY_ENV" '
-                [.[] | select((.displayTitle | test("^Deploy " + $env + "( |$)"))
-                  or ($env == "production" and .displayTitle == "Deploy to App Platform"))][1].databaseId // empty')
+                [.[] | select(.displayTitle | test("^Deploy " + $env + "( |$)"))][1].databaseId // empty')
             [ -n "$target" ] || { echo "::error::No earlier successful $DEPLOY_ENV deploy to roll back to"; exit 1; }
             echo "Rolling back $DEPLOY_ENV to the release deployed by run $target"
-            gh run download "$target" --name "deployed-release-$DEPLOY_ENV" --dir release ||
-              gh run download "$target" --name deployed-release --dir release
+            gh run download "$target" --name "deployed-release-$DEPLOY_ENV" --dir release
           else
             if [ -z "$BUILD_RUN_ID" ]; then
               BUILD_RUN_ID=$(gh run list --workflow docker-publish.yml --branch "$GITHUB_REF_NAME" \
@@ -84,18 +82,26 @@ jobs:
         id: manifest
         run: |
           m=release/manifest.json
-          case "$(jq -r .schemaVersion $m)" in
-            2) specJson=$(jq -c --arg env "$DEPLOY_ENV" '.specs[$env] // empty' $m) ;;
-            # v1 bundles predate per-environment specs and hold the production spec only.
-            1) [ "$DEPLOY_ENV" = production ] && specJson=$(jq -c .spec $m) ;;
-            *) echo "::error::Unsupported manifest schemaVersion"; exit 1 ;;
-          esac
+          # Older releases have no environments.yaml; deploying one would move the app back to
+          # its old region, so they can't be deployed.
+          [ "$(jq -r .schemaVersion $m)" = "3" ] ||
+            { echo "::error::Release uses manifest schemaVersion $(jq -r .schemaVersion $m); only 3 is supported. Deploy a newer build."; exit 1; }
+          specJson=$(jq -c --arg env "$DEPLOY_ENV" '.specs[$env] // empty' $m)
           [ -n "$specJson" ] || { echo "::error::Release has no $DEPLOY_ENV spec"; exit 1; }
           spec="release/$(jq -r .file <<<"$specJson")"
-          echo "$(jq -r .sha256 <<<"$specJson")  $spec" | sha256sum -c -
+          config="release/$(jq -r .config.file $m)"
+          {
+            echo "$(jq -r .sha256 <<<"$specJson")  $spec"
+            echo "$(jq -r .config.sha256 $m)  $config"
+          } | sha256sum -c -
+          datacenter=$(yq -r ".\"$DEPLOY_ENV\".datacenter // \"\"" "$config")
+          vpc=$(yq -r ".\"$DEPLOY_ENV\".vpc // \"\"" "$config")
+          [ -n "$datacenter" ] || { echo "::error::environments.yaml has no datacenter for $DEPLOY_ENV"; exit 1; }
           echo "image=$(jq -r '"\(.image.registry)/\(.image.name)@\(.image.digest)"' $m)" >> "$GITHUB_OUTPUT"
           echo "digest=$(jq -r .image.digest $m)" >> "$GITHUB_OUTPUT"
           echo "spec=$spec" >> "$GITHUB_OUTPUT"
+          echo "datacenter=$datacenter" >> "$GITHUB_OUTPUT"
+          echo "vpc=$vpc" >> "$GITHUB_OUTPUT"
 
       # Production only takes images that have already been deployed to QA, unless this is a
       # rollback (restoring something production already ran) or a hotfix (skip_qa_check).
@@ -137,12 +143,45 @@ jobs:
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
 
+      # App Platform runs in a region (sfo) and can only attach VPCs in that region's one
+      # App Platform datacenter (sfo3), so the datacenter decides the region.
+      - name: Resolve region and VPC
+        id: location
+        env:
+          DATACENTER: ${{ steps.manifest.outputs.datacenter }}
+          VPC: ${{ steps.manifest.outputs.vpc }}
+        run: |
+          case "$DATACENTER" in
+            ams3|atl1|blr1|fra1|lon1|nyc1|sfo3|sgp1|syd1|tor1) region=${DATACENTER%%[0-9]*} ;;
+            *) echo "::error::App Platform can't run in datacenter '$DATACENTER'. Use one of: ams3 atl1 blr1 fra1 lon1 nyc1 sfo3 sgp1 syd1 tor1"; exit 1 ;;
+          esac
+          vpcId=""
+          if [ -n "$VPC" ]; then
+            vpcJson=$(doctl vpcs list --output json | jq -c --arg name "$VPC" '[.[] | select(.name == $name)][0] // empty')
+            [ -n "$vpcJson" ] || { echo "::error::VPC '$VPC' not found"; exit 1; }
+            vpcRegion=$(jq -r .region <<<"$vpcJson")
+            [ "$vpcRegion" = "$DATACENTER" ] ||
+              { echo "::error::VPC '$VPC' is in $vpcRegion, not $DATACENTER"; exit 1; }
+            vpcId=$(jq -r .id <<<"$vpcJson")
+          fi
+          echo "Deploying $DEPLOY_ENV to region $region (datacenter $DATACENTER), VPC '${VPC:-none}' ${vpcId}"
+          echo "region=$region" >> "$GITHUB_OUTPUT"
+          echo "vpc_id=$vpcId" >> "$GITHUB_OUTPUT"
+
       - name: Render app spec
         env:
           IMAGE_DIGEST: ${{ steps.manifest.outputs.digest }}
           GHCR_CREDENTIALS: ${{ secrets.GHCR_CREDENTIALS }}
+          APP_REGION: ${{ steps.location.outputs.region }}
+          VPC_ID: ${{ steps.location.outputs.vpc_id }}
         run: |
           envsubst '${IMAGE_DIGEST} ${GHCR_CREDENTIALS}' < "${{ steps.manifest.outputs.spec }}" > app.rendered.yaml
+          yq -i '.region = strenv(APP_REGION)' app.rendered.yaml
+          if [ -n "$VPC_ID" ]; then
+            yq -i '.vpc.id = strenv(VPC_ID)' app.rendered.yaml
+          else
+            yq -i 'del(.vpc)' app.rendered.yaml
+          fi
           grep -v registry_credentials app.rendered.yaml
 
       - name: Deploy to App Platform
@@ -156,9 +195,17 @@ jobs:
         env:
           ROLLBACK: ${{ inputs.rollback }}
           QA_CHECK_SKIPPED: ${{ inputs.environment == 'production' && !inputs.rollback && inputs.skip_qa_check }}
+          DATACENTER: ${{ steps.manifest.outputs.datacenter }}
+          APP_REGION: ${{ steps.location.outputs.region }}
+          VPC: ${{ steps.manifest.outputs.vpc }}
+          VPC_ID: ${{ steps.location.outputs.vpc_id }}
         run: |
           jq -n \
             --arg environment "$DEPLOY_ENV" \
+            --arg datacenter "$DATACENTER" \
+            --arg region "$APP_REGION" \
+            --arg vpc "$VPC" \
+            --arg vpcId "$VPC_ID" \
             --arg deployedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg runId "$GITHUB_RUN_ID" \
             --arg actor "$GITHUB_ACTOR" \
@@ -167,6 +214,9 @@ jobs:
             --slurpfile app app.single.json \
             '{
               environment: $environment,
+              region: $region,
+              datacenter: $datacenter,
+              vpc: (if $vpc == "" then null else { name: $vpc, id: $vpcId } end),
               deployedAt: $deployedAt,
               deployRunId: ($runId | tonumber),
               actor: $actor,

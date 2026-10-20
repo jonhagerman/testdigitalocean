@@ -3,10 +3,10 @@
 # manifest.json (.github/workflows/docker-publish.yml), and .github/workflows/deploy.yml
 # deploys the chosen environment's copy from the bundle, so a rollback restores the spec
 # as well as the image.
+# region and vpc are set at deploy time from .do/environments.yaml.
 # ${IMAGE_DIGEST} is substituted at deploy time with the digest recorded in the manifest,
 # pinning the exact image that was built rather than a mutable tag.
 name: testdigitalocean-qa
-region: nyc
 
 services:
   - name: web

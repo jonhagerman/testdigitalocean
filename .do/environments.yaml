@@ -1,0 +1,17 @@
+# Where each environment's App Platform app runs. Every build copies this file into its
+# release bundle, so deploying or rolling back a release also restores its location.
+#
+# datacenter: the datacenter the app's VPC is in. The app runs in that datacenter's App Platform
+#             region (sfo3 -> sfo). App Platform can only attach VPCs in one datacenter per region:
+#             ams3, atl1, blr1, fra1, lon1, nyc1, sfo3, sgp1, syd1, tor1
+# vpc:        name of a VPC in that datacenter (doctl vpcs list), or "" to not attach a VPC.
+#
+# Changing either one on an existing app redeploys it in place. Moving to another region keeps
+# the app, but any database it uses stays where it is.
+qa:
+  datacenter: sfo3
+  vpc: default-sfo3
+
+production:
+  datacenter: sfo3
+  vpc: default-sfo3

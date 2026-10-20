@@ -70,8 +70,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # The release bundle (manifest.json + one app spec template per environment) is
-      # what deploy.yml deploys. It pins the image by digest, so deploying or rolling back
+      # The release bundle (manifest.json + one app spec template per environment +
+      # environments.yaml with each environment's datacenter and VPC) is what deploy.yml deploys. It pins the image by digest, so deploying or rolling back
       # to a build always gets exactly the image and spec that build produced.
       - name: Create release manifest
         if: github.event_name != 'pull_request'
@@ -81,7 +81,7 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p release
-          cp .do/app.qa.yaml .do/app.production.yaml release/
+          cp .do/app.qa.yaml .do/app.production.yaml .do/environments.yaml release/
           spec() { jq -n --arg file "$1" --arg sha256 "$(sha256sum "release/$1" | cut -d' ' -f1)" '{file: $file, sha256: $sha256}'; }
           jq -n \
             --arg version "$VERSION" \
@@ -96,8 +96,9 @@ jobs:
             --arg tags "$TAGS" \
             --argjson qaSpec "$(spec app.qa.yaml)" \
             --argjson productionSpec "$(spec app.production.yaml)" \
+            --argjson config "$(spec environments.yaml)" \
             '{
-              schemaVersion: 2,
+              schemaVersion: 3,
               app: "testdigitalocean",
               version: $version,
               commit: $commit,
@@ -109,7 +110,8 @@ jobs:
                 digest: $digest,
                 tags: ($tags | split("\n") | map(select(length > 0) | split(":") | last))
               },
-              specs: { qa: $qaSpec, production: $productionSpec }
+              specs: { qa: $qaSpec, production: $productionSpec },
+              config: $config
             }' > release/manifest.json
           cat release/manifest.json
           {
