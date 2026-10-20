@@ -1,32 +1,50 @@
 name: Deploy to App Platform
+run-name: >-
+  Deploy ${{ inputs.environment }}${{ inputs.rollback && ' - rollback' || '' }}${{ !inputs.rollback && inputs.build_run_id && format(' - build {0}', inputs.build_run_id) || '' }}${{ inputs.environment == 'production' && !inputs.rollback && inputs.skip_qa_check && ' - hotfix' || '' }}
 
-# Deploys a release bundle (manifest.json + app.yaml) produced by docker-publish.yml.
-# - Deploy a build:        set build_run_id (blank = latest successful build of the selected branch/tag)
-# - Roll back one step:    tick rollback (redeploys what was live before the last successful deploy)
+# Deploys a release bundle (manifest.json + per-environment app specs) produced by docker-publish.yml.
+# See docs/deployment.md. In short:
+# - Deploy a build:        pick the environment, set build_run_id (blank = latest successful build of the selected branch/tag)
+# - Promote to production: deploy the same build_run_id to production; it must have been deployed to QA first
+# - Hotfix:                tick skip_qa_check to deploy to production without a QA deploy
+# - Roll back one step:    tick rollback (redeploys what was live in that environment before its last successful deploy)
 # - Roll back further:     set build_run_id to any earlier build run
+#
+# The run-name ("Deploy <environment> ...") is how later runs find an environment's deploy history,
+# so keep it starting with "Deploy ${{ inputs.environment }}".
 on:
   workflow_dispatch:
     inputs:
+      environment:
+        description: "Environment to deploy to."
+        type: choice
+        options: [qa, production]
+        default: qa
       build_run_id:
         description: "Run ID of the 'Build and publish container' run to deploy. Blank = latest successful build of the selected branch/tag."
         required: false
         default: ""
       rollback:
-        description: "Roll back: ignore build_run_id and redeploy the release that was live before the last successful deploy."
+        description: "Roll back: ignore build_run_id and redeploy the release that was live in this environment before its last successful deploy."
+        type: boolean
+        default: false
+      skip_qa_check:
+        description: "Hotfix (production only): deploy even if this build has not been deployed to QA."
         type: boolean
         default: false
 
 concurrency:
-  group: deploy-production
+  group: deploy-${{ inputs.environment }}
   cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
+  DEPLOY_ENV: ${{ inputs.environment }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: production
+    environment: ${{ inputs.environment }}
     permissions:
       actions: read
       packages: read
@@ -40,19 +58,24 @@ jobs:
           ROLLBACK: ${{ inputs.rollback }}
         run: |
           if [ "$ROLLBACK" = "true" ]; then
-            # Newest successful deploy is what's live now; the one before it is the rollback target.
-            target=$(gh run list --workflow deploy.yml --status success --limit 2 \
-              --json databaseId --jq '.[1].databaseId // empty')
-            [ -n "$target" ] || { echo "::error::No earlier successful deploy to roll back to"; exit 1; }
-            echo "Rolling back to the release deployed by run $target"
-            gh run download "$target" --name deployed-release --dir release
+            # Newest successful deploy to this environment is what's live now; the one before it is
+            # the rollback target. Runs from before per-environment deploys were titled
+            # "Deploy to App Platform", uploaded "deployed-release", and all went to production.
+            target=$(gh run list --workflow deploy.yml --status success --limit 100 --json databaseId,displayTitle |
+              jq -r --arg env "$DEPLOY_ENV" '
+                [.[] | select((.displayTitle | test("^Deploy " + $env + "( |$)"))
+                  or ($env == "production" and .displayTitle == "Deploy to App Platform"))][1].databaseId // empty')
+            [ -n "$target" ] || { echo "::error::No earlier successful $DEPLOY_ENV deploy to roll back to"; exit 1; }
+            echo "Rolling back $DEPLOY_ENV to the release deployed by run $target"
+            gh run download "$target" --name "deployed-release-$DEPLOY_ENV" --dir release ||
+              gh run download "$target" --name deployed-release --dir release
           else
             if [ -z "$BUILD_RUN_ID" ]; then
               BUILD_RUN_ID=$(gh run list --workflow docker-publish.yml --branch "$GITHUB_REF_NAME" \
                 --event push --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
               [ -n "$BUILD_RUN_ID" ] || { echo "::error::No successful build found for $GITHUB_REF_NAME"; exit 1; }
             fi
-            echo "Deploying the release built by run $BUILD_RUN_ID"
+            echo "Deploying the release built by run $BUILD_RUN_ID to $DEPLOY_ENV"
             gh run download "$BUILD_RUN_ID" --name release-manifest --dir release
           fi
           cat release/manifest.json
@@ -61,12 +84,43 @@ jobs:
         id: manifest
         run: |
           m=release/manifest.json
-          [ "$(jq -r .schemaVersion $m)" = "1" ] || { echo "::error::Unsupported manifest schemaVersion"; exit 1; }
-          spec="release/$(jq -r .spec.file $m)"
-          echo "$(jq -r .spec.sha256 $m)  $spec" | sha256sum -c -
+          case "$(jq -r .schemaVersion $m)" in
+            2) specJson=$(jq -c --arg env "$DEPLOY_ENV" '.specs[$env] // empty' $m) ;;
+            # v1 bundles predate per-environment specs and hold the production spec only.
+            1) [ "$DEPLOY_ENV" = production ] && specJson=$(jq -c .spec $m) ;;
+            *) echo "::error::Unsupported manifest schemaVersion"; exit 1 ;;
+          esac
+          [ -n "$specJson" ] || { echo "::error::Release has no $DEPLOY_ENV spec"; exit 1; }
+          spec="release/$(jq -r .file <<<"$specJson")"
+          echo "$(jq -r .sha256 <<<"$specJson")  $spec" | sha256sum -c -
           echo "image=$(jq -r '"\(.image.registry)/\(.image.name)@\(.image.digest)"' $m)" >> "$GITHUB_OUTPUT"
           echo "digest=$(jq -r .image.digest $m)" >> "$GITHUB_OUTPUT"
           echo "spec=$spec" >> "$GITHUB_OUTPUT"
+
+      # Production only takes images that have already been deployed to QA, unless this is a
+      # rollback (restoring something production already ran) or a hotfix (skip_qa_check).
+      - name: Require QA deploy
+        if: inputs.environment == 'production' && !inputs.rollback
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+          SKIP_QA_CHECK: ${{ inputs.skip_qa_check }}
+        run: |
+          if [ "$SKIP_QA_CHECK" = "true" ]; then
+            echo "::warning::Hotfix: QA check skipped for $DIGEST"
+            exit 0
+          fi
+          for id in $(gh run list --workflow deploy.yml --status success --limit 100 --json databaseId,displayTitle \
+                --jq '.[] | select(.displayTitle | test("^Deploy qa( |$)")) | .databaseId'); do
+            if gh run download "$id" --name deployed-release-qa --dir "qa-check/$id" 2>/dev/null &&
+               [ "$(jq -r .image.digest "qa-check/$id/manifest.json")" = "$DIGEST" ]; then
+              echo "Image $DIGEST was deployed to QA by run $id"
+              exit 0
+            fi
+          done
+          echo "::error::Image $DIGEST has not been deployed to QA. Deploy this build to QA first, or tick skip_qa_check for a hotfix."
+          exit 1
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -97,27 +151,33 @@ jobs:
           jq 'if type == "array" then .[0] else . end' app.json > app.single.json
           jq '{id, live_url, active_deployment: .active_deployment.id}' app.single.json
 
-      # The deployed bundle is what a later rollback restores.
+      # The deployed bundle is what a later rollback restores, and what the production QA check looks for.
       - name: Record deployment
         env:
           ROLLBACK: ${{ inputs.rollback }}
+          QA_CHECK_SKIPPED: ${{ inputs.environment == 'production' && !inputs.rollback && inputs.skip_qa_check }}
         run: |
           jq -n \
+            --arg environment "$DEPLOY_ENV" \
             --arg deployedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg runId "$GITHUB_RUN_ID" \
             --arg actor "$GITHUB_ACTOR" \
             --argjson rollback "$ROLLBACK" \
+            --argjson qaCheckSkipped "$QA_CHECK_SKIPPED" \
             --slurpfile app app.single.json \
             '{
+              environment: $environment,
               deployedAt: $deployedAt,
               deployRunId: ($runId | tonumber),
               actor: $actor,
               rollback: $rollback,
+              qaCheckSkipped: $qaCheckSkipped,
               appId: $app[0].id,
+              liveUrl: $app[0].live_url,
               deploymentId: $app[0].active_deployment.id
             }' > release/deployment.json
           {
-            echo "### Deployed"
+            echo "### Deployed to $DEPLOY_ENV"
             echo '```json'
             jq -s '.[0] + {deployment: .[1]}' release/manifest.json release/deployment.json
             echo '```'
@@ -126,6 +186,6 @@ jobs:
       - name: Upload deployed release
         uses: actions/upload-artifact@v4
         with:
-          name: deployed-release
+          name: deployed-release-${{ inputs.environment }}
           path: release/
           retention-days: 90

@@ -1,7 +1,8 @@
-# DigitalOcean App Platform spec.
-# This file is a template. Every build copies it into its release bundle alongside
+# DigitalOcean App Platform spec for the production environment (app.qa.yaml is QA).
+# This file is a template. Every build copies both specs into its release bundle alongside
 # manifest.json (.github/workflows/docker-publish.yml), and .github/workflows/deploy.yml
-# deploys the copy from the chosen bundle, so a rollback restores the spec as well as the image.
+# deploys the chosen environment's copy from the bundle, so a rollback restores the spec
+# as well as the image.
 # ${IMAGE_DIGEST} is substituted at deploy time with the digest recorded in the manifest,
 # pinning the exact image that was built rather than a mutable tag.
 name: testdigitalocean

@@ -70,9 +70,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # The release bundle (manifest.json + the app spec template) is what deploy.yml
-      # deploys. It pins the image by digest, so deploying or rolling back to a build
-      # always gets exactly the image and spec that build produced.
+      # The release bundle (manifest.json + one app spec template per environment) is
+      # what deploy.yml deploys. It pins the image by digest, so deploying or rolling back
+      # to a build always gets exactly the image and spec that build produced.
       - name: Create release manifest
         if: github.event_name != 'pull_request'
         env:
@@ -81,7 +81,8 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p release
-          cp .do/app.yaml release/app.yaml
+          cp .do/app.qa.yaml .do/app.production.yaml release/
+          spec() { jq -n --arg file "$1" --arg sha256 "$(sha256sum "release/$1" | cut -d' ' -f1)" '{file: $file, sha256: $sha256}'; }
           jq -n \
             --arg version "$VERSION" \
             --arg commit "$GITHUB_SHA" \
@@ -93,9 +94,10 @@ jobs:
             --arg name "${IMAGE_NAME,,}" \
             --arg digest "$DIGEST" \
             --arg tags "$TAGS" \
-            --arg specSha256 "$(sha256sum release/app.yaml | cut -d' ' -f1)" \
+            --argjson qaSpec "$(spec app.qa.yaml)" \
+            --argjson productionSpec "$(spec app.production.yaml)" \
             '{
-              schemaVersion: 1,
+              schemaVersion: 2,
               app: "testdigitalocean",
               version: $version,
               commit: $commit,
@@ -107,12 +109,12 @@ jobs:
                 digest: $digest,
                 tags: ($tags | split("\n") | map(select(length > 0) | split(":") | last))
               },
-              spec: { file: "app.yaml", sha256: $specSha256 }
+              specs: { qa: $qaSpec, production: $productionSpec }
             }' > release/manifest.json
           cat release/manifest.json
           {
             echo "### Release manifest"
-            echo "Deploy with **Actions -> Deploy to App Platform**, build run ID \`$GITHUB_RUN_ID\`."
+            echo "Deploy with **Actions -> Deploy to App Platform**, build run ID \`$GITHUB_RUN_ID\` (QA first, then production)."
             echo '```json'
             cat release/manifest.json
             echo '```'
